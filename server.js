@@ -12,14 +12,28 @@ const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 app.use(cors());
 app.use(express.json());
 
-// In-memory storage (replace with DB in production)
-let users = {};
-let sessions = {};
-let jobs = {};
+// ===============================
+// MEMORY STORAGE (USE DB IN PROD)
+// ===============================
+const users = {};
+const sessions = {};
+const jobs = {};
 
-// =============================
-// AUTH: GOOGLE LOGIN
-// =============================
+// ===============================
+// HELPER: AUTH MIDDLEWARE
+// ===============================
+function auth(req, res, next) {
+    const token = req.headers.authorization;
+    if (!token || !sessions[token]) {
+        return res.status(401).json({ error: "Unauthorized" });
+    }
+    req.session = sessions[token];
+    next();
+}
+
+// ===============================
+// GOOGLE LOGIN
+// ===============================
 app.post("/api/auth/google", async (req, res) => {
     try {
         const { token } = req.body;
@@ -40,7 +54,7 @@ app.post("/api/auth/google", async (req, res) => {
         users[user.id] = user;
 
         const sessionToken = uuidv4();
-        sessions[sessionToken] = user;
+        sessions[sessionToken] = { user };
 
         res.json({ success: true, token: sessionToken, user });
 
@@ -49,9 +63,9 @@ app.post("/api/auth/google", async (req, res) => {
     }
 });
 
-// =============================
-// COOKIE LOGIN (LIKE PYTHON)
-// =============================
+// ===============================
+// COOKIE LOGIN (PYTHON STYLE)
+// ===============================
 app.post("/api/login", async (req, res) => {
     try {
         const { cookie } = req.body;
@@ -67,12 +81,16 @@ app.post("/api/login", async (req, res) => {
         );
 
         const match = response.data.match(/(EAAG\w+)/);
+
         if (!match) throw new Error("Token not found");
 
-        const token = match[1];
+        const fbToken = match[1];
 
         const sessionToken = uuidv4();
-        sessions[sessionToken] = { cookie, token };
+        sessions[sessionToken] = {
+            cookie,
+            fbToken
+        };
 
         res.json({ success: true, token: sessionToken });
 
@@ -81,20 +99,15 @@ app.post("/api/login", async (req, res) => {
     }
 });
 
-// =============================
-// GET USER INFO
-// =============================
-app.get("/api/user", async (req, res) => {
+// ===============================
+// GET FACEBOOK USER
+// ===============================
+app.get("/api/user", auth, async (req, res) => {
     try {
-        const auth = req.headers.authorization;
-        const session = sessions[auth];
-
-        if (!session) return res.status(401).json({ error: "Unauthorized" });
-
-        const { token, cookie } = session;
+        const { fbToken, cookie } = req.session;
 
         const response = await axios.get(
-            `https://b-graph.facebook.com/me?fields=name,id&access_token=${token}`,
+            `https://b-graph.facebook.com/me?fields=name,id&access_token=${fbToken}`,
             {
                 headers: { cookie }
             }
@@ -107,55 +120,58 @@ app.get("/api/user", async (req, res) => {
     }
 });
 
-// =============================
+// ===============================
 // START SHARE JOB
-// =============================
-app.post("/api/share", (req, res) => {
-    const auth = req.headers.authorization;
-    const session = sessions[auth];
-
-    if (!session) return res.status(401).json({ error: "Unauthorized" });
-
+// ===============================
+app.post("/api/share", auth, (req, res) => {
     const { link, amount, delay } = req.body;
+
+    if (!link || !amount || !delay) {
+        return res.status(400).json({ error: "Missing fields" });
+    }
 
     const jobId = uuidv4();
 
     jobs[jobId] = {
         logs: [],
-        progress: 0
+        progress: 0,
+        done: false
     };
 
-    runShare(jobId, session, link, amount, delay);
+    runShare(jobId, req.session, link, amount, delay);
 
     res.json({ jobId });
 });
 
-// =============================
-// SHARE FUNCTION (LIKE PYTHON LOOP)
-// =============================
+// ===============================
+// SHARE ENGINE (LIKE PYTHON LOOP)
+// ===============================
 async function runShare(jobId, session, link, amount, delay) {
-    const { token, cookie } = session;
+    const { fbToken, cookie } = session;
 
     for (let i = 1; i <= amount; i++) {
         try {
-            const res = await axios.post(
+            const response = await axios.post(
                 `https://b-graph.facebook.com/v13.0/me/feed`,
                 null,
                 {
                     params: {
                         link,
                         published: 0,
-                        access_token: token
+                        access_token: fbToken
                     },
                     headers: { cookie }
                 }
             );
 
-            jobs[jobId].logs.push(`[${i}] Success: ${res.data.id}`);
+            const id = response.data.id || "unknown";
+
+            jobs[jobId].logs.push(`[${i}] SUCCESS → ${id}`);
 
         } catch (err) {
-            jobs[jobId].logs.push(`[${i}] Failed`);
-            break;
+            jobs[jobId].logs.push(`[${i}] ERROR → Share failed`);
+            jobs[jobId].done = true;
+            return;
         }
 
         jobs[jobId].progress = Math.floor((i / amount) * 100);
@@ -166,9 +182,9 @@ async function runShare(jobId, session, link, amount, delay) {
     jobs[jobId].done = true;
 }
 
-// =============================
+// ===============================
 // SSE STREAM (LIVE TERMINAL)
-// =============================
+// ===============================
 app.get("/api/stream/:jobId", (req, res) => {
 
     const jobId = req.params.jobId;
@@ -191,7 +207,7 @@ app.get("/api/stream/:jobId", (req, res) => {
 
         lastIndex = job.logs.length;
 
-        // send progress
+        // progress
         res.write(`data: PROGRESS:${job.progress}\n\n`);
 
         if (job.done) {
@@ -201,36 +217,20 @@ app.get("/api/stream/:jobId", (req, res) => {
         }
 
     }, 1000);
+
+    req.on("close", () => clearInterval(interval));
 });
 
-// =============================
-// BASIC EMAIL/PASSWORD (OPTIONAL)
-// =============================
-app.post("/api/auth/register", (req, res) => {
-    const { email, password } = req.body;
-
-    const id = uuidv4();
-    users[id] = { id, email, password };
-
+// ===============================
+// LOGOUT
+// ===============================
+app.post("/api/logout", auth, (req, res) => {
+    const token = req.headers.authorization;
+    delete sessions[token];
     res.json({ success: true });
 });
 
-app.post("/api/auth/login", (req, res) => {
-    const { email, password } = req.body;
-
-    const user = Object.values(users).find(
-        u => u.email === email && u.password === password
-    );
-
-    if (!user) return res.status(400).json({ error: "Invalid credentials" });
-
-    const token = uuidv4();
-    sessions[token] = user;
-
-    res.json({ token });
-});
-
-// =============================
+// ===============================
 app.listen(process.env.PORT, () => {
-    console.log("Server running on port " + process.env.PORT);
+    console.log("🚀 Server running on port " + process.env.PORT);
 });
