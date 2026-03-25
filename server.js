@@ -12,16 +12,13 @@ const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 app.use(cors());
 app.use(express.json());
 
-// ===============================
-// MEMORY STORAGE (USE DB IN PROD)
-// ===============================
+// ================= DATABASE (MEMORY) =================
 const users = {};
 const sessions = {};
 const jobs = {};
+const paymentRequests = {};
 
-// ===============================
-// HELPER: AUTH MIDDLEWARE
-// ===============================
+// ================= AUTH MIDDLEWARE =================
 function auth(req, res, next) {
     const token = req.headers.authorization;
     if (!token || !sessions[token]) {
@@ -31,9 +28,25 @@ function auth(req, res, next) {
     next();
 }
 
-// ===============================
-// GOOGLE LOGIN
-// ===============================
+// ================= PREMIUM CHECK =================
+function requirePremium(req, res, next) {
+    const user = req.session.user;
+
+    if (!user) return res.status(401).json({ error: "No user" });
+
+    if (user.plan === "FREE") {
+        return res.status(403).json({ error: "Upgrade to premium" });
+    }
+
+    if (user.expiresAt && Date.now() > user.expiresAt) {
+        user.plan = "FREE";
+        return res.status(403).json({ error: "Subscription expired" });
+    }
+
+    next();
+}
+
+// ================= GOOGLE LOGIN =================
 app.post("/api/auth/google", async (req, res) => {
     try {
         const { token } = req.body;
@@ -48,7 +61,9 @@ app.post("/api/auth/google", async (req, res) => {
         const user = {
             id: payload.sub,
             email: payload.email,
-            name: payload.name
+            name: payload.name,
+            plan: "FREE",
+            expiresAt: null
         };
 
         users[user.id] = user;
@@ -56,16 +71,14 @@ app.post("/api/auth/google", async (req, res) => {
         const sessionToken = uuidv4();
         sessions[sessionToken] = { user };
 
-        res.json({ success: true, token: sessionToken, user });
+        res.json({ token: sessionToken, user });
 
-    } catch (err) {
+    } catch {
         res.status(400).json({ error: "Google login failed" });
     }
 });
 
-// ===============================
-// COOKIE LOGIN (PYTHON STYLE)
-// ===============================
+// ================= COOKIE LOGIN =================
 app.post("/api/login", async (req, res) => {
     try {
         const { cookie } = req.body;
@@ -75,60 +88,54 @@ app.post("/api/login", async (req, res) => {
             {
                 headers: {
                     "user-agent": "Mozilla/5.0",
-                    "cookie": cookie
+                    cookie
                 }
             }
         );
 
         const match = response.data.match(/(EAAG\w+)/);
-
-        if (!match) throw new Error("Token not found");
+        if (!match) throw new Error();
 
         const fbToken = match[1];
 
         const sessionToken = uuidv4();
         sessions[sessionToken] = {
             cookie,
-            fbToken
+            fbToken,
+            user: {
+                id: uuidv4(),
+                plan: "FREE",
+                expiresAt: null
+            }
         };
 
-        res.json({ success: true, token: sessionToken });
+        res.json({ token: sessionToken });
 
-    } catch (err) {
+    } catch {
         res.status(400).json({ error: "Invalid cookie" });
     }
 });
 
-// ===============================
-// GET FACEBOOK USER
-// ===============================
+// ================= GET USER =================
 app.get("/api/user", auth, async (req, res) => {
     try {
         const { fbToken, cookie } = req.session;
 
         const response = await axios.get(
             `https://b-graph.facebook.com/me?fields=name,id&access_token=${fbToken}`,
-            {
-                headers: { cookie }
-            }
+            { headers: { cookie } }
         );
 
         res.json(response.data);
 
-    } catch (err) {
+    } catch {
         res.status(400).json({ error: "Failed to fetch user" });
     }
 });
 
-// ===============================
-// START SHARE JOB
-// ===============================
-app.post("/api/share", auth, (req, res) => {
+// ================= START SHARE =================
+app.post("/api/share", auth, requirePremium, (req, res) => {
     const { link, amount, delay } = req.body;
-
-    if (!link || !amount || !delay) {
-        return res.status(400).json({ error: "Missing fields" });
-    }
 
     const jobId = uuidv4();
 
@@ -143,16 +150,14 @@ app.post("/api/share", auth, (req, res) => {
     res.json({ jobId });
 });
 
-// ===============================
-// SHARE ENGINE (LIKE PYTHON LOOP)
-// ===============================
+// ================= SHARE ENGINE =================
 async function runShare(jobId, session, link, amount, delay) {
     const { fbToken, cookie } = session;
 
     for (let i = 1; i <= amount; i++) {
         try {
-            const response = await axios.post(
-                `https://b-graph.facebook.com/v13.0/me/feed`,
+            const r = await axios.post(
+                "https://b-graph.facebook.com/v13.0/me/feed",
                 null,
                 {
                     params: {
@@ -164,12 +169,10 @@ async function runShare(jobId, session, link, amount, delay) {
                 }
             );
 
-            const id = response.data.id || "unknown";
+            jobs[jobId].logs.push(`[${i}] SUCCESS → ${r.data.id}`);
 
-            jobs[jobId].logs.push(`[${i}] SUCCESS → ${id}`);
-
-        } catch (err) {
-            jobs[jobId].logs.push(`[${i}] ERROR → Share failed`);
+        } catch {
+            jobs[jobId].logs.push(`[${i}] FAILED`);
             jobs[jobId].done = true;
             return;
         }
@@ -182,9 +185,7 @@ async function runShare(jobId, session, link, amount, delay) {
     jobs[jobId].done = true;
 }
 
-// ===============================
-// SSE STREAM (LIVE TERMINAL)
-// ===============================
+// ================= SSE STREAM =================
 app.get("/api/stream/:jobId", (req, res) => {
 
     const jobId = req.params.jobId;
@@ -193,21 +194,17 @@ app.get("/api/stream/:jobId", (req, res) => {
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
 
-    let lastIndex = 0;
+    let last = 0;
 
     const interval = setInterval(() => {
         const job = jobs[jobId];
         if (!job) return;
 
-        // send new logs
-        const newLogs = job.logs.slice(lastIndex);
-        newLogs.forEach(log => {
-            res.write(`data: ${log}\n\n`);
-        });
+        const logs = job.logs.slice(last);
+        logs.forEach(l => res.write(`data: ${l}\n\n`));
 
-        lastIndex = job.logs.length;
+        last = job.logs.length;
 
-        // progress
         res.write(`data: PROGRESS:${job.progress}\n\n`);
 
         if (job.done) {
@@ -221,16 +218,48 @@ app.get("/api/stream/:jobId", (req, res) => {
     req.on("close", () => clearInterval(interval));
 });
 
-// ===============================
-// LOGOUT
-// ===============================
-app.post("/api/logout", auth, (req, res) => {
-    const token = req.headers.authorization;
-    delete sessions[token];
+// ================= PREMIUM REQUEST =================
+app.post("/api/premium/request", auth, (req, res) => {
+    const { plan, reference } = req.body;
+
+    const id = uuidv4();
+
+    paymentRequests[id] = {
+        id,
+        user: req.session.user,
+        plan,
+        reference,
+        status: "PENDING"
+    };
+
+    res.json({ message: "Request sent" });
+});
+
+// ================= ADMIN APPROVE =================
+app.post("/api/admin/approve", (req, res) => {
+    const { requestId } = req.body;
+
+    const reqPay = paymentRequests[requestId];
+    if (!reqPay) return res.status(404).json({ error: "Not found" });
+
+    const user = reqPay.user;
+
+    if (reqPay.plan === "WEEKLY") {
+        user.expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
+    }
+
+    user.plan = reqPay.plan;
+    reqPay.status = "APPROVED";
+
     res.json({ success: true });
 });
 
-// ===============================
+// ================= PREMIUM STATUS =================
+app.get("/api/premium/status", auth, (req, res) => {
+    res.json(req.session.user);
+});
+
+// ================= START SERVER =================
 app.listen(process.env.PORT, () => {
-    console.log("🚀 Server running on port " + process.env.PORT);
+    console.log("🚀 Server running on http://localhost:" + process.env.PORT);
 });
