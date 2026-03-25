@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ShareBooster</title>
+<!-- Tailwind CSS CDN -->
+<script src="https://cdn.tailwindcss.com"></script>
+<!-- Lucide Icons -->
+<script src="https://cdn.jsdelivr.net/npm/lucide/dist/lucide.min.js"></script>
+<!-- Google Identity Services -->
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<style>
+  body { background: #0a0a14; color: white; font-family: sans-serif; }
+  .glass { backdrop-filter: blur(16px); background: rgba(20,20,30,0.6); border-radius: 12px; padding: 1rem; }
+  #logs { height: 300px; overflow-y: scroll; background: #111; padding: 1rem; border-radius: 8px; font-family: monospace; }
+</style>
+</head>
+<body class="p-4">
+
+<!-- LANDING PAGE -->
+<div id="page-landing" class="max-w-4xl mx-auto text-center">
+  <h1 class="text-4xl font-bold mb-4">Boost Your Reach 🚀</h1>
+  <p class="mb-6">Automatically share Facebook posts and grow engagement.</p>
+
+  <div class="flex justify-center gap-4 mb-4">
+    <button id="googleLoginBtn" class="bg-purple-600 hover:bg-purple-700 px-6 py-2 rounded">Login with Google</button>
+    <button id="fbCookieBtn" class="bg-indigo-600 hover:bg-indigo-700 px-6 py-2 rounded">Login with FB Cookie</button>
+  </div>
+
+  <div class="glass p-4 mt-6">
+    <h2 class="font-bold text-xl mb-2">Premium Plans</h2>
+    <div class="flex justify-center gap-4">
+      <button onclick="requestPremium('WEEKLY')" class="bg-yellow-500 px-4 py-2 rounded">₱30 / Week</button>
+      <button onclick="requestPremium('LIFETIME')" class="bg-green-500 px-4 py-2 rounded">₱100 / Lifetime</button>
+    </div>
+    <div id="premiumStatus" class="mt-2"></div>
+  </div>
+</div>
+
+<!-- DASHBOARD -->
+<div id="page-dashboard" class="max-w-4xl mx-auto hidden">
+  <h2 class="text-2xl font-bold mb-4">Dashboard</h2>
+
+  <div class="glass p-4 mb-4">
+    <h3 class="font-bold mb-2">Post Sharing</h3>
+    <input id="postLink" placeholder="Post Link" class="w-full mb-2 p-2 rounded text-black">
+    <input id="shareAmount" type="number" placeholder="Share Count" class="w-full mb-2 p-2 rounded text-black">
+    <input id="shareDelay" type="number" placeholder="Delay (sec)" class="w-full mb-2 p-2 rounded text-black">
+    <button onclick="startShare()" class="bg-purple-600 px-4 py-2 rounded">Start Sharing</button>
+  </div>
+
+  <div class="glass p-4 mb-4">
+    <h3 class="font-bold mb-2">Live Terminal</h3>
+    <div id="logs"></div>
+    <div class="h-2 bg-gray-700 rounded mt-2">
+      <div id="progress" class="h-2 bg-green-500 rounded w-0"></div>
+    </div>
+  </div>
+
+  <button onclick="logout()" class="bg-red-600 px-4 py-2 rounded">Logout</button>
+</div>
+
+<script>
+let token = localStorage.getItem("sessionToken");
+let evt;
+
+// =================== UTILS ===================
+function showDashboard() {
+  document.getElementById('page-landing').classList.add('hidden');
+  document.getElementById('page-dashboard').classList.remove('hidden');
+  getPremiumStatus();
+}
+
+function showLanding() {
+  document.getElementById('page-landing').classList.remove('hidden');
+  document.getElementById('page-dashboard').classList.add('hidden');
+  localStorage.removeItem("sessionToken");
+}
+
+// =================== LOGOUT ===================
+function logout() {
+  fetch('/api/logout', { method: 'POST', headers:{ 'Authorization': token } });
+  showLanding();
+}
+
+// =================== GOOGLE LOGIN ===================
+window.onGoogleLibraryLoad = () => {
+  google.accounts.id.initialize({
+    client_id: 'PUT_YOUR_GOOGLE_CLIENT_ID_HERE',
+    callback: handleGoogleLogin
+  });
+  google.accounts.id.renderButton(document.getElementById('googleLoginBtn'), { theme: 'filled_blue', size: 'large' });
+}
+
+function handleGoogleLogin(response) {
+  fetch('/api/auth/google', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ token: response.credential })
+  }).then(r=>r.json()).then(data=>{
+    token = data.token;
+    localStorage.setItem("sessionToken", token);
+    showDashboard();
+  });
+}
+
+// =================== FB COOKIE LOGIN ===================
+document.getElementById('fbCookieBtn').addEventListener('click', ()=>{
+  const cookie = prompt("Enter FB Cookie");
+  fetch('/api/login',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ cookie })
+  }).then(r=>r.json()).then(data=>{
+    if(data.token){ token = data.token; localStorage.setItem("sessionToken", token); showDashboard(); }
+    else alert(data.error);
+  });
+});
+
+// =================== START SHARE ===================
+function startShare() {
+  const link = document.getElementById('postLink').value;
+  const amount = parseInt(document.getElementById('shareAmount').value);
+  const delay = parseInt(document.getElementById('shareDelay').value);
+
+  fetch('/api/share',{
+    method:'POST',
+    headers:{'Content-Type':'application/json','Authorization':token},
+    body: JSON.stringify({ link, amount, delay })
+  }).then(r=>r.json()).then(data=>{
+    if(!data.jobId) return alert('Failed to start share');
+    const jobId = data.jobId;
+    const logsDiv = document.getElementById('logs');
+    const progressBar = document.getElementById('progress');
+    logsDiv.innerHTML = '';
+    progressBar.style.width = '0%';
+
+    if(evt) evt.close();
+    evt = new EventSource(`/api/stream/${jobId}`);
+    evt.onmessage = e=>{
+      if(e.data.startsWith('PROGRESS:')){
+        const p = e.data.split(':')[1];
+        progressBar.style.width = p+'%';
+      } else if(e.data==='DONE'){ evt.close(); }
+      else logsDiv.innerHTML += e.data+'<br>';
+      logsDiv.scrollTop = logsDiv.scrollHeight;
+    }
+  });
+}
+
+// =================== PREMIUM ===================
+function requestPremium(plan){
+  const ref = prompt("Enter Payment Reference (GCash/Manual)");
+  fetch('/api/premium/request',{
+    method:'POST',
+    headers:{'Content-Type':'application/json','Authorization':token},
+    body: JSON.stringify({ plan, reference: ref })
+  }).then(r=>r.json()).then(d=>alert(d.message));
+}
+
+function getPremiumStatus(){
+  fetch('/api/premium/status',{ headers:{'Authorization':token} })
+    .then(r=>r.json()).then(d=>{
+      const s = d.plan + (d.expiresAt ? ' | Expires: '+new Date(d.expiresAt).toLocaleString() : '');
+      document.getElementById('premiumStatus').innerText = s;
+  });
+}
+
+// =================== AUTO LOAD ===================
+if(token) showDashboard();
+</script>
+</body>
+</html>
